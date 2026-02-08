@@ -1447,7 +1447,7 @@ async def main():
     # R2 credentials
     r2_access_key = 'fdfa18bf64b18c61bbee64fda98ca20b'
     r2_secret_key = '394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8'
-    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.eu.r2.cloudflarestorage.com'
+    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.r2.cloudflarestorage.com'
     r2_bucket = args.r2_bucket
 
     config = Config(
