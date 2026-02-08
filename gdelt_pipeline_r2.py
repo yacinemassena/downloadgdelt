@@ -1470,9 +1470,12 @@ async def main():
         r2_secret_access_key=r2_secret_key,
     )
 
-    # Ensure directories exist
-    config.temp_dir.mkdir(parents=True, exist_ok=True)
+    # Clean temp files from previous runs to free disk space
     config.gdelt_base_dir.mkdir(parents=True, exist_ok=True)
+    if config.temp_dir.exists():
+        shutil.rmtree(config.temp_dir, ignore_errors=True)
+        print(f"Cleaned temp directory: {config.temp_dir}")
+    config.temp_dir.mkdir(parents=True, exist_ok=True)
 
     # Create pipeline
     pipeline = GDELTPipeline(config)
