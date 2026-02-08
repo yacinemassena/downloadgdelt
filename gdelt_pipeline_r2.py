@@ -24,7 +24,7 @@ Features:
 - Filtering for Events, Mentions, and GKG
 
 Usage:
-    python gdelt_pipeline_r2.py --download-workers 5
+    python gdelt_pipeline_r2.py --download-workers 50
     python gdelt_pipeline_r2.py --gdelt-version 1 --start-date 20040101 --end-date 20150218
     python gdelt_pipeline_r2.py --gdelt-version 2 --start-date 20150219
 
@@ -89,7 +89,7 @@ class Config:
     gdelt_version: int = 2
 
     # Worker configuration
-    download_workers: int = 5
+    download_workers: int = 50
     process_workers: int = 2
     upload_workers: int = 3
     duckdb_memory_limit: str = "4GB"
@@ -711,37 +711,51 @@ class DownloadManager:
         self.logger = logger
         self.stats = stats
         self.shutdown_event = asyncio.Event()
+        self._session = None
 
-    async def download_file(self, url: str, dest_path: Path, expected_hash: Optional[str] = None) -> bool:
-        """Download a single file with retry logic."""
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Get or create a shared aiohttp session."""
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=self.config.download_workers, limit_per_host=50, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=self.config.download_timeout)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return self._session
+
+    async def close(self):
+        """Close the shared session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def download_file(self, url: str, dest_path: Path, semaphore: asyncio.Semaphore, expected_hash: Optional[str] = None) -> Optional[Path]:
+        """Download a single file with retry logic. Returns dest_path on success, None on failure."""
         filename = url.split('/')[-1]
 
         # Skip if already downloaded
         if filename in self.state.state.downloaded_files:
             self.stats.files_download_skipped += 1
-            return True
+            return dest_path if dest_path.exists() else None
 
         # Check if file exists locally
         if dest_path.exists():
             await self.state.mark_downloaded(filename)
             self.stats.files_download_skipped += 1
-            return True
+            return dest_path
 
-        self.stats.current_download = filename
+        async with semaphore:
+            self.stats.current_download = filename
+            session = await self._ensure_session()
 
-        for attempt in range(self.config.max_retries):
-            if self.shutdown_event.is_set():
-                return False
+            for attempt in range(self.config.max_retries):
+                if self.shutdown_event.is_set():
+                    return None
 
-            try:
-                timeout = aiohttp.ClientTimeout(total=self.config.download_timeout)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                try:
                     async with session.get(url) as response:
                         if response.status == 404:
                             self.logger.debug(f"File not found (404), skipping: {filename}")
                             await self.state.mark_download_failed(url)
                             self.stats.files_download_failed += 1
-                            return False
+                            return None
 
                         if response.status != 200:
                             raise Exception(f"HTTP {response.status}")
@@ -752,43 +766,41 @@ class DownloadManager:
                             async for chunk in response.content.iter_chunked(1024 * 1024):
                                 if self.shutdown_event.is_set():
                                     temp_path.unlink(missing_ok=True)
-                                    return False
+                                    return None
                                 await f.write(chunk)
                                 file_size += len(chunk)
 
                         temp_path.rename(dest_path)
 
-                await self.state.mark_downloaded(filename)
-                self.stats.files_downloaded += 1
-                self.stats.bytes_downloaded += file_size
-                self.logger.debug(f"Downloaded: {filename}")
-                return True
+                    await self.state.mark_downloaded(filename)
+                    self.stats.files_downloaded += 1
+                    self.stats.bytes_downloaded += file_size
+                    self.logger.debug(f"Downloaded: {filename}")
+                    return dest_path
 
-            except Exception as e:
-                self.logger.warning(f"Download attempt {attempt + 1}/{self.config.max_retries} failed for {filename}: {e}")
-                if attempt < self.config.max_retries - 1:
-                    await asyncio.sleep(self.config.retry_delay * (attempt + 1))
+                except Exception as e:
+                    self.logger.warning(f"Download attempt {attempt + 1}/{self.config.max_retries} failed for {filename}: {e}")
+                    if attempt < self.config.max_retries - 1:
+                        await asyncio.sleep(self.config.retry_delay * (attempt + 1))
 
-        await self.state.mark_download_failed(url)
-        self.stats.files_download_failed += 1
-        self.logger.warning(f"Failed to download after {self.config.max_retries} attempts: {filename}")
-        return False
+            await self.state.mark_download_failed(url)
+            self.stats.files_download_failed += 1
+            self.logger.warning(f"Failed to download after {self.config.max_retries} attempts: {filename}")
+            return None
 
-    async def download_day(self, day_key: str, entries: List[Tuple[str, str, str]]) -> List[Path]:
-        """Download all files for a specific day."""
+    async def download_day(self, day_key: str, entries: List[Tuple[str, str, str]], semaphore: asyncio.Semaphore) -> List[Path]:
+        """Download all files for a specific day concurrently."""
         day_temp_dir = self.config.temp_dir / f"{day_key}"
         day_temp_dir.mkdir(parents=True, exist_ok=True)
 
-        downloaded_files = []
+        tasks = []
         for size, hash_val, url in entries:
-            if self.shutdown_event.is_set():
-                break
             filename = url.split('/')[-1]
             dest_path = day_temp_dir / filename
-            if await self.download_file(url, dest_path, hash_val):
-                downloaded_files.append(dest_path)
+            tasks.append(self.download_file(url, dest_path, semaphore, hash_val))
 
-        return downloaded_files
+        results = await asyncio.gather(*tasks)
+        return [p for p in results if p is not None]
 
 
 # =============================================================================
@@ -1177,14 +1189,13 @@ class GDELTPipeline:
         total = len(sorted_items)
         self.stats.days_to_process = total
         self.stats.files_to_upload = total
+        self.stats.files_to_download = sum(len(v) for v in grouped.values())
 
         semaphore = asyncio.Semaphore(self.config.download_workers)
 
-        for idx, (day_key, day_entries) in enumerate(sorted_items):
+        async def _download_one_day(day_key: str, day_entries: List[Tuple[str, str, str]]):
             if self.shutdown_requested:
-                break
-
-            self.stats.files_to_download = sum(len(v) for v in grouped.values())
+                return
 
             # Check if already fully done (processed + uploaded)
             date, ftype = day_key.split('_')
@@ -1194,17 +1205,21 @@ class GDELTPipeline:
                 self.stats.days_processed += 1
                 self.stats.files_uploaded += 1
                 await self.stats.add_log(f"[dim]Skip (done): {day_key}[/dim]")
-                continue
+                return
 
-            async with semaphore:
-                if self.shutdown_requested:
-                    break
-                downloaded = await self.download_manager.download_day(day_key, day_entries)
+            downloaded = await self.download_manager.download_day(day_key, day_entries, semaphore)
 
-                if downloaded and not self.shutdown_requested:
-                    await self.download_queue.put((day_key, downloaded))
-                    self.stats.download_queue_depth = self.download_queue.qsize()
-                    await self.stats.add_log(f"[blue]Downloaded:[/blue] {day_key} ({len(downloaded)} files)")
+            if downloaded and not self.shutdown_requested:
+                await self.download_queue.put((day_key, downloaded))
+                self.stats.download_queue_depth = self.download_queue.qsize()
+                await self.stats.add_log(f"[blue]Downloaded:[/blue] {day_key} ({len(downloaded)} files)")
+
+        # Launch all day downloads concurrently; semaphore limits actual connections
+        tasks = [_download_one_day(day_key, day_entries) for day_key, day_entries in sorted_items]
+        await asyncio.gather(*tasks)
+
+        # Close the shared download session
+        await self.download_manager.close()
 
         # Signal end of downloads
         await self.download_queue.put(None)
@@ -1346,8 +1361,8 @@ def parse_args():
     parser.add_argument(
         '--download-workers',
         type=int,
-        default=5,
-        help='Number of concurrent download workers (default: 5)'
+        default=50,
+        help='Number of concurrent download workers (default: 50)'
     )
 
     parser.add_argument(
@@ -1432,7 +1447,7 @@ async def main():
     # R2 credentials
     r2_access_key = 'fdfa18bf64b18c61bbee64fda98ca20b'
     r2_secret_key = '394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8'
-    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.r2.cloudflarestorage.com'
+    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.eu.r2.cloudflarestorage.com'
     r2_bucket = args.r2_bucket
 
     config = Config(
@@ -1455,32 +1470,9 @@ async def main():
         r2_secret_access_key=r2_secret_key,
     )
 
-    # Clean temp files from previous runs to free disk space
-    config.gdelt_base_dir.mkdir(parents=True, exist_ok=True)
-    if config.temp_dir.exists():
-        shutil.rmtree(config.temp_dir, ignore_errors=True)
-        print(f"Cleaned temp directory: {config.temp_dir}")
+    # Ensure directories exist
     config.temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Also delete any leftover processed CSVs that were already uploaded
-    state_path = config.state_file
-    if state_path.exists():
-        with open(state_path, 'r') as f:
-            prev_state = json.load(f)
-        uploaded = set(prev_state.get("uploaded_files", []))
-        cleaned = 0
-        for csv_file in config.gdelt_base_dir.rglob("*.csv"):
-            # Build the r2 key from the file path to check if already uploaded
-            try:
-                rel = csv_file.relative_to(config.gdelt_base_dir)
-                r2_key = str(rel).replace("\\", "/")
-                if r2_key in uploaded:
-                    csv_file.unlink()
-                    cleaned += 1
-            except Exception:
-                pass
-        if cleaned:
-            print(f"Cleaned {cleaned} already-uploaded CSV files from disk")
+    config.gdelt_base_dir.mkdir(parents=True, exist_ok=True)
 
     # Create pipeline
     pipeline = GDELTPipeline(config)
