@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+pipeline_crash.log
+*.bak
+githubrepo.md
+R2info.md
