@@ -1432,7 +1432,7 @@ async def main():
     # R2 credentials
     r2_access_key = 'fdfa18bf64b18c61bbee64fda98ca20b'
     r2_secret_key = '394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8'
-    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.eu.r2.cloudflarestorage.com'
+    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.r2.cloudflarestorage.com'
     r2_bucket = args.r2_bucket
 
     config = Config(
@@ -1455,9 +1455,32 @@ async def main():
         r2_secret_access_key=r2_secret_key,
     )
 
-    # Ensure directories exist
-    config.temp_dir.mkdir(parents=True, exist_ok=True)
+    # Clean temp files from previous runs to free disk space
     config.gdelt_base_dir.mkdir(parents=True, exist_ok=True)
+    if config.temp_dir.exists():
+        shutil.rmtree(config.temp_dir, ignore_errors=True)
+        print(f"Cleaned temp directory: {config.temp_dir}")
+    config.temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Also delete any leftover processed CSVs that were already uploaded
+    state_path = config.state_file
+    if state_path.exists():
+        with open(state_path, 'r') as f:
+            prev_state = json.load(f)
+        uploaded = set(prev_state.get("uploaded_files", []))
+        cleaned = 0
+        for csv_file in config.gdelt_base_dir.rglob("*.csv"):
+            # Build the r2 key from the file path to check if already uploaded
+            try:
+                rel = csv_file.relative_to(config.gdelt_base_dir)
+                r2_key = str(rel).replace("\\", "/")
+                if r2_key in uploaded:
+                    csv_file.unlink()
+                    cleaned += 1
+            except Exception:
+                pass
+        if cleaned:
+            print(f"Cleaned {cleaned} already-uploaded CSV files from disk")
 
     # Create pipeline
     pipeline = GDELTPipeline(config)
