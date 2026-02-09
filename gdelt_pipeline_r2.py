@@ -24,7 +24,7 @@ Features:
 - Filtering for Events, Mentions, and GKG
 
 Usage:
-    python gdelt_pipeline_r2.py --download-workers 50
+    python gdelt_pipeline_r2.py --download-workers 5
     python gdelt_pipeline_r2.py --gdelt-version 1 --start-date 20040101 --end-date 20150218
     python gdelt_pipeline_r2.py --gdelt-version 2 --start-date 20150219
 
@@ -89,7 +89,7 @@ class Config:
     gdelt_version: int = 2
 
     # Worker configuration
-    download_workers: int = 50
+    download_workers: int = 5
     process_workers: int = 2
     upload_workers: int = 3
     duckdb_memory_limit: str = "4GB"
@@ -120,6 +120,9 @@ class Config:
     # Queue sizes (limits memory usage)
     download_queue_size: int = 20
     upload_queue_size: int = 10
+
+    # Disk usage limit (GB) - pause downloads when base_dir exceeds this
+    max_disk_gb: float = 30.0
 
 
 # =============================================================================
@@ -701,6 +704,18 @@ def build_gkg_theme_filter_sql() -> str:
 # DOWNLOAD MANAGER
 # =============================================================================
 
+def get_dir_size_gb(path: Path) -> float:
+    """Get total size of a directory in GB."""
+    total = 0
+    try:
+        for f in path.rglob('*'):
+            if f.is_file():
+                total += f.stat().st_size
+    except Exception:
+        pass
+    return total / (1024 ** 3)
+
+
 class DownloadManager:
     """Manages async file downloads."""
 
@@ -1183,6 +1198,15 @@ class GDELTPipeline:
         self.processor.shutdown_event.set()
         self.uploader.shutdown_event.set()
 
+    async def _wait_for_disk_space(self):
+        """Wait until disk usage drops below max_disk_gb."""
+        while not self.shutdown_requested:
+            usage_gb = get_dir_size_gb(self.config.gdelt_base_dir)
+            if usage_gb < self.config.max_disk_gb:
+                return
+            await self.stats.add_log(f"[red]Disk usage {usage_gb:.1f}GB >= {self.config.max_disk_gb}GB limit. Pausing downloads...[/red]")
+            await asyncio.sleep(10)
+
     async def _stage_download(self, grouped: Dict[str, List[Tuple[str, str, str]]]):
         """Stage 1: Download files and put them on the download_queue for processing."""
         sorted_items = sorted(grouped.items())
@@ -1205,6 +1229,12 @@ class GDELTPipeline:
                 self.stats.days_processed += 1
                 self.stats.files_uploaded += 1
                 await self.stats.add_log(f"[dim]Skip (done): {day_key}[/dim]")
+                return
+
+            # Wait if disk usage is too high
+            await self._wait_for_disk_space()
+
+            if self.shutdown_requested:
                 return
 
             downloaded = await self.download_manager.download_day(day_key, day_entries, semaphore)
@@ -1361,8 +1391,8 @@ def parse_args():
     parser.add_argument(
         '--download-workers',
         type=int,
-        default=50,
-        help='Number of concurrent download workers (default: 50)'
+        default=5,
+        help='Number of concurrent download workers (default: 5)'
     )
 
     parser.add_argument(
@@ -1428,6 +1458,13 @@ def parse_args():
         help='R2 bucket name (default: europe)'
     )
 
+    parser.add_argument(
+        '--max-disk-gb',
+        type=float,
+        default=30.0,
+        help='Max disk usage in GB before pausing downloads (default: 30)'
+    )
+
     return parser.parse_args()
 
 
@@ -1447,7 +1484,7 @@ async def main():
     # R2 credentials
     r2_access_key = 'fdfa18bf64b18c61bbee64fda98ca20b'
     r2_secret_key = '394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8'
-    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.r2.cloudflarestorage.com'
+    r2_endpoint = 'https://2a139e9393f803634546ad9d541d37b9.eu.r2.cloudflarestorage.com'
     r2_bucket = args.r2_bucket
 
     config = Config(
@@ -1459,6 +1496,7 @@ async def main():
         download_workers=args.download_workers,
         process_workers=args.process_workers,
         upload_workers=args.upload_workers,
+        max_disk_gb=args.max_disk_gb,
         duckdb_memory_limit=args.memory_limit,
         file_types=file_types,
         start_date=args.start_date,
@@ -1470,12 +1508,9 @@ async def main():
         r2_secret_access_key=r2_secret_key,
     )
 
-    # Clean temp files from previous runs to free disk space
-    config.gdelt_base_dir.mkdir(parents=True, exist_ok=True)
-    if config.temp_dir.exists():
-        shutil.rmtree(config.temp_dir, ignore_errors=True)
-        print(f"Cleaned temp directory: {config.temp_dir}")
+    # Ensure directories exist
     config.temp_dir.mkdir(parents=True, exist_ok=True)
+    config.gdelt_base_dir.mkdir(parents=True, exist_ok=True)
 
     # Create pipeline
     pipeline = GDELTPipeline(config)
