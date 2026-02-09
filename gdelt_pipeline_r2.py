@@ -121,8 +121,8 @@ class Config:
     download_queue_size: int = 20
     upload_queue_size: int = 10
 
-    # Disk usage limit (GB) - pause downloads when base_dir exceeds this
-    max_disk_gb: float = 30.0
+    # Minimum free disk space (GB) - pause downloads when free space drops below this
+    min_free_disk_gb: float = 5.0
 
 
 # =============================================================================
@@ -704,16 +704,13 @@ def build_gkg_theme_filter_sql() -> str:
 # DOWNLOAD MANAGER
 # =============================================================================
 
-def get_dir_size_gb(path: Path) -> float:
-    """Get total size of a directory in GB."""
-    total = 0
+def get_free_disk_gb(path: Path) -> float:
+    """Get free disk space in GB (instant, no scanning)."""
     try:
-        for f in path.rglob('*'):
-            if f.is_file():
-                total += f.stat().st_size
+        usage = shutil.disk_usage(str(path))
+        return usage.free / (1024 ** 3)
     except Exception:
-        pass
-    return total / (1024 ** 3)
+        return 999.0  # assume plenty if check fails
 
 
 class DownloadManager:
@@ -757,6 +754,15 @@ class DownloadManager:
             return dest_path
 
         async with semaphore:
+            # Wait for free disk space before downloading
+            while not self.shutdown_event.is_set():
+                free_gb = get_free_disk_gb(self.config.temp_dir)
+                if free_gb >= self.config.min_free_disk_gb:
+                    break
+                await asyncio.sleep(5)
+            if self.shutdown_event.is_set():
+                return None
+
             self.stats.current_download = filename
             session = await self._ensure_session()
 
@@ -1199,12 +1205,12 @@ class GDELTPipeline:
         self.uploader.shutdown_event.set()
 
     async def _wait_for_disk_space(self):
-        """Wait until disk usage drops below max_disk_gb."""
+        """Wait until free disk space is above min_free_disk_gb."""
         while not self.shutdown_requested:
-            usage_gb = get_dir_size_gb(self.config.gdelt_base_dir)
-            if usage_gb < self.config.max_disk_gb:
+            free_gb = get_free_disk_gb(self.config.gdelt_base_dir)
+            if free_gb >= self.config.min_free_disk_gb:
                 return
-            await self.stats.add_log(f"[red]Disk usage {usage_gb:.1f}GB >= {self.config.max_disk_gb}GB limit. Pausing downloads...[/red]")
+            await self.stats.add_log(f"[red]Free disk {free_gb:.1f}GB < {self.config.min_free_disk_gb}GB minimum. Pausing downloads...[/red]")
             await asyncio.sleep(10)
 
     async def _stage_download(self, grouped: Dict[str, List[Tuple[str, str, str]]]):
@@ -1459,10 +1465,10 @@ def parse_args():
     )
 
     parser.add_argument(
-        '--max-disk-gb',
+        '--min-free-disk-gb',
         type=float,
-        default=30.0,
-        help='Max disk usage in GB before pausing downloads (default: 30)'
+        default=5.0,
+        help='Minimum free disk space in GB before pausing downloads (default: 5)'
     )
 
     return parser.parse_args()
@@ -1496,7 +1502,7 @@ async def main():
         download_workers=args.download_workers,
         process_workers=args.process_workers,
         upload_workers=args.upload_workers,
-        max_disk_gb=args.max_disk_gb,
+        min_free_disk_gb=args.min_free_disk_gb,
         duckdb_memory_limit=args.memory_limit,
         file_types=file_types,
         start_date=args.start_date,
