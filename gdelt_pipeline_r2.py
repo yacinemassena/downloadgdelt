@@ -1258,15 +1258,16 @@ class GDELTPipeline:
         self.stats.download_stage_done = True
         await self.stats.add_log("[green]Download stage complete[/green]")
 
-    async def _stage_process(self):
-        """Stage 2: Process downloaded files and put results on upload_queue."""
+    async def _process_worker(self, worker_id: int):
+        """Single process worker that consumes from download_queue."""
         while True:
             if self.shutdown_requested:
                 break
 
             item = await self.download_queue.get()
             if item is None:
-                # End sentinel
+                # Put sentinel back for other workers, then exit
+                await self.download_queue.put(None)
                 break
 
             day_key, zip_files = item
@@ -1282,20 +1283,27 @@ class GDELTPipeline:
                 self.stats.upload_queue_depth = self.upload_queue.qsize()
                 await self.stats.add_log(f"[yellow]Processed:[/yellow] {day_key} ({row_count:,} rows)")
 
-        # Signal end of processing
-        await self.upload_queue.put(None)
+    async def _stage_process(self):
+        """Stage 2: Launch multiple process workers to consume from download_queue."""
+        workers = [self._process_worker(i) for i in range(self.config.process_workers)]
+        await asyncio.gather(*workers)
+
+        # Signal end of processing (one sentinel per upload worker)
+        for _ in range(self.config.upload_workers):
+            await self.upload_queue.put(None)
         self.stats.process_stage_done = True
         await self.stats.add_log("[green]Process stage complete[/green]")
 
-    async def _stage_upload(self):
-        """Stage 3: Upload processed files to R2 and delete local copies."""
+    async def _upload_worker(self, worker_id: int):
+        """Single upload worker that consumes from upload_queue."""
         while True:
             if self.shutdown_requested:
                 break
 
             item = await self.upload_queue.get()
             if item is None:
-                # End sentinel
+                # Put sentinel back for other workers, then exit
+                await self.upload_queue.put(None)
                 break
 
             local_path, r2_key = item
@@ -1306,6 +1314,11 @@ class GDELTPipeline:
                 await self.stats.add_log(f"[green]Uploaded + deleted:[/green] {r2_key}")
             else:
                 await self.stats.add_log(f"[red]Upload failed:[/red] {r2_key}")
+
+    async def _stage_upload(self):
+        """Stage 3: Launch multiple upload workers to consume from upload_queue."""
+        workers = [self._upload_worker(i) for i in range(self.config.upload_workers)]
+        await asyncio.gather(*workers)
 
         self.stats.upload_stage_done = True
         await self.stats.add_log("[green]Upload stage complete[/green]")
