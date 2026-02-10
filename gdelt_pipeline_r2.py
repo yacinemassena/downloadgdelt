@@ -47,7 +47,6 @@ import re
 import shutil
 import signal
 import sys
-import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -924,8 +923,7 @@ class DataProcessor:
                         csv_name = csv_names[0]
                         csv_content = zf.read(csv_name).decode('utf-8', errors='replace')
 
-                        tid = threading.get_ident()
-                        temp_csv = self.config.temp_dir / f"temp_{tid}_{day_key}_{zip_path.stem}.csv"
+                        temp_csv = self.config.temp_dir / f"temp_{day_key}_{zip_path.stem}.csv"
                         with open(temp_csv, 'w', encoding='utf-8') as f:
                             f.write(csv_content)
 
@@ -1260,16 +1258,15 @@ class GDELTPipeline:
         self.stats.download_stage_done = True
         await self.stats.add_log("[green]Download stage complete[/green]")
 
-    async def _process_worker(self, worker_id: int):
-        """Single process worker that consumes from download_queue."""
+    async def _stage_process(self):
+        """Stage 2: Process downloaded files and put results on upload_queue."""
         while True:
             if self.shutdown_requested:
                 break
 
             item = await self.download_queue.get()
             if item is None:
-                # Put sentinel back for other workers, then exit
-                await self.download_queue.put(None)
+                # End sentinel
                 break
 
             day_key, zip_files = item
@@ -1285,27 +1282,20 @@ class GDELTPipeline:
                 self.stats.upload_queue_depth = self.upload_queue.qsize()
                 await self.stats.add_log(f"[yellow]Processed:[/yellow] {day_key} ({row_count:,} rows)")
 
-    async def _stage_process(self):
-        """Stage 2: Launch multiple process workers to consume from download_queue."""
-        workers = [self._process_worker(i) for i in range(self.config.process_workers)]
-        await asyncio.gather(*workers)
-
-        # Signal end of processing (one sentinel per upload worker)
-        for _ in range(self.config.upload_workers):
-            await self.upload_queue.put(None)
+        # Signal end of processing
+        await self.upload_queue.put(None)
         self.stats.process_stage_done = True
         await self.stats.add_log("[green]Process stage complete[/green]")
 
-    async def _upload_worker(self, worker_id: int):
-        """Single upload worker that consumes from upload_queue."""
+    async def _stage_upload(self):
+        """Stage 3: Upload processed files to R2 and delete local copies."""
         while True:
             if self.shutdown_requested:
                 break
 
             item = await self.upload_queue.get()
             if item is None:
-                # Put sentinel back for other workers, then exit
-                await self.upload_queue.put(None)
+                # End sentinel
                 break
 
             local_path, r2_key = item
@@ -1316,11 +1306,6 @@ class GDELTPipeline:
                 await self.stats.add_log(f"[green]Uploaded + deleted:[/green] {r2_key}")
             else:
                 await self.stats.add_log(f"[red]Upload failed:[/red] {r2_key}")
-
-    async def _stage_upload(self):
-        """Stage 3: Launch multiple upload workers to consume from upload_queue."""
-        workers = [self._upload_worker(i) for i in range(self.config.upload_workers)]
-        await asyncio.gather(*workers)
 
         self.stats.upload_stage_done = True
         await self.stats.add_log("[green]Upload stage complete[/green]")
