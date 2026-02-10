@@ -47,6 +47,7 @@ import re
 import shutil
 import signal
 import sys
+import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -923,7 +924,8 @@ class DataProcessor:
                         csv_name = csv_names[0]
                         csv_content = zf.read(csv_name).decode('utf-8', errors='replace')
 
-                        temp_csv = self.config.temp_dir / f"temp_{day_key}_{zip_path.stem}.csv"
+                        tid = threading.get_ident()
+                        temp_csv = self.config.temp_dir / f"temp_{tid}_{day_key}_{zip_path.stem}.csv"
                         with open(temp_csv, 'w', encoding='utf-8') as f:
                             f.write(csv_content)
 
