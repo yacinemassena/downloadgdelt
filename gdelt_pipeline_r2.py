@@ -753,16 +753,16 @@ class DownloadManager:
             self.stats.files_download_skipped += 1
             return dest_path
 
-        async with semaphore:
-            # Wait for free disk space before downloading
-            while not self.shutdown_event.is_set():
-                free_gb = get_free_disk_gb(self.config.temp_dir)
-                if free_gb >= self.config.min_free_disk_gb:
-                    break
-                await asyncio.sleep(5)
-            if self.shutdown_event.is_set():
-                return None
+        # Wait for free disk space BEFORE acquiring semaphore
+        while not self.shutdown_event.is_set():
+            free_gb = get_free_disk_gb(self.config.gdelt_base_dir)
+            if free_gb >= self.config.min_free_disk_gb:
+                break
+            await asyncio.sleep(5)
+        if self.shutdown_event.is_set():
+            return None
 
+        async with semaphore:
             self.stats.current_download = filename
             session = await self._ensure_session()
 
@@ -1223,9 +1223,9 @@ class GDELTPipeline:
 
         semaphore = asyncio.Semaphore(self.config.download_workers)
 
-        async def _download_one_day(day_key: str, day_entries: List[Tuple[str, str, str]]):
+        for day_key, day_entries in sorted_items:
             if self.shutdown_requested:
-                return
+                break
 
             # Check if already fully done (processed + uploaded)
             date, ftype = day_key.split('_')
@@ -1235,13 +1235,13 @@ class GDELTPipeline:
                 self.stats.days_processed += 1
                 self.stats.files_uploaded += 1
                 await self.stats.add_log(f"[dim]Skip (done): {day_key}[/dim]")
-                return
+                continue
 
             # Wait if disk usage is too high
             await self._wait_for_disk_space()
 
             if self.shutdown_requested:
-                return
+                break
 
             downloaded = await self.download_manager.download_day(day_key, day_entries, semaphore)
 
@@ -1249,10 +1249,6 @@ class GDELTPipeline:
                 await self.download_queue.put((day_key, downloaded))
                 self.stats.download_queue_depth = self.download_queue.qsize()
                 await self.stats.add_log(f"[blue]Downloaded:[/blue] {day_key} ({len(downloaded)} files)")
-
-        # Launch all day downloads concurrently; semaphore limits actual connections
-        tasks = [_download_one_day(day_key, day_entries) for day_key, day_entries in sorted_items]
-        await asyncio.gather(*tasks)
 
         # Close the shared download session
         await self.download_manager.close()
